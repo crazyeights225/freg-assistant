@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Freg Helper
+Comment=Little desktop helper hooked up to Claude
+Exec=/usr/bin/python3 /home/crazy/Desktop/freg-assistant/freg_helper.py
+Icon=face-smile
+Terminal=false
+X-GNOME-Autostart-enabled=true
