@@ -7,7 +7,7 @@ Freg is a little desktop assistant inspired by clippy. I drew the frog in like 5
 
 Freg is a little desktop frog that sits in the corner of your screen and talks to a coding
 agent: Claude Code or [pi](https://pi.dev).
-Click Freg to ask a question and the reply appears as speech bubbles. When nobody is talking to Freg, it tells the odd pun, takes naps and dances.
+Click Freg to ask a question and the reply appears as speech bubbles. When nobody is talking to Freg, it tells the odd pun, takes naps, dances and goes fishing.
 
 Here an example of freg on my desktop
 
@@ -69,8 +69,8 @@ The right-click menu has these options:
 - **New conversation**: starts a new session.
 - **Agent**: switches between Claude Code and pi. Switching starts a new conversation.
 - **Quiet mode**: stops the random quips.
-- **Idle antics**: turns the naps and dancing on or off.
-- **Nap time / Wake up!** and **Dance!**: make Freg nap, wake up or dance right away.
+- **Idle antics**: turns the naps, dancing and fishing on or off.
+- **Nap time / Wake up!**, **Dance!** and **Go fishing**: make Freg nap, wake up, dance or fish right away.
 - **Move back to corner** and **Quit Freg**.
 
 ## Configuration
@@ -95,17 +95,4 @@ Sizes, timings, quips and the colour theme are constants near the top of
 
 ## Assets
 
-The sprites and the font are in `assets/`:
-
-| File | Used for |
-| --- | --- |
-| `frog.png` | Freg standing |
-| `blink.png` | Freg blinking |
-| `speaking1.png` … `speaking6.png` | Mouth frames while Freg talks |
-| `sleep_frame1.png` … `sleep_frame3.png` | Nap animation |
-| `arms.png` | Second dance pose |
-| `Ldfcomicsans.ttf` | Font for the speech bubbles |
-
-Sprites are scaled to `SPRITE_H` (110 px). You can add or remove numbered speaking
-frames and sleep frames: Freg loads whichever frames it finds. If `arms.png` is missing,
-the dance option is turned off. If there are no sleep frames, the nap option is turned off.
+The sprites and the font are in `assets/`.

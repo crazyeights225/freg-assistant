@@ -46,11 +46,29 @@ NAP_FRAME_SECONDS = 0.9
 DANCE_SECONDS = (5, 9)  # how long a dance lasts
 DANCE_BEAT = 0.4  # seconds per step: swap frog.png/arms.png and lean the other way
 DANCE_LEAN = 0.14  # radians (~8°)
+FISH_WAIT_SECONDS = (6, 15)  # how long Freg waits for a bite
+FISH_STARE = (1.5, 3.5)  # seconds on fishing1 (eyes open) between blinks while he waits
+FISH_BLINK = 0.2  # seconds on fishing2, where his eyes are closed
+FISH_FRAMES = ["side_neutral", "fishing1", "fishing2", "fish_caught",
+               "fish_pull_frame1", "fish_pull_frame2", "fish_pull_frame3", "fish_celebrate"]
+# Spots in the art itself (unscaled pixels): where the line ends, and Freg's raised left hand.
+FISH_LINE_ENDS = {"fish_pull_frame2": (11, 127), "fish_pull_frame3": (5, 61)}
+FISH_HAND = (153, 90)
 BUBBLE_W = 300  # widest a speech bubble gets
 SPEECH_H = 270  # tallest a speech bubble gets (long paragraphs are split into pages)
 ASK_H = 64  # the ask box plus its tail
 PAGE_CHARS = 240  # split paragraphs longer than this into several bubbles
 DEBUG = bool(os.environ.get("FREG_DEBUG"))
+# Where pi might be installed, tried in order; autostarted apps often lack these on PATH.
+PI_LOCATIONS = [
+    shutil.which("pi") or "",
+    "~/.local/bin/pi",
+    "~/.nvm/versions/node/*/bin/pi",
+    "~/.npm-global/bin/pi",
+    "~/.local/bin/node/pi",
+    "/usr/local/bin/pi",
+    "/usr/bin/pi",
+]
 
 
 def debug(*args):
@@ -175,10 +193,28 @@ def body_center_x(pixbuf):
     return (cols[0] + cols[-1]) / 2 if cols else w / 2
 
 
+def body_feet(pixbuf):
+    """(middle x, lowest y) of the green body — rods, lines and ripples aren't green."""
+    w, h = pixbuf.get_width(), pixbuf.get_height()
+    rs, n, px = pixbuf.get_rowstride(), pixbuf.get_n_channels(), pixbuf.get_pixels()
+    green = [(x, y) for y in range(int(h * 0.7), h) for x in range(w)
+             if px[y * rs + x * n + 3] > 200
+             and px[y * rs + x * n + 1] > px[y * rs + x * n] + 30
+             and px[y * rs + x * n + 1] > px[y * rs + x * n + 2]]
+    if not green:
+        return w / 2, h
+    xs = [x for x, _ in green]
+    return (min(xs) + max(xs)) / 2, max(y for _, y in green)
+
+
+def natural_key(path):
+    """Sort key that puts frame2 before frame10 (and node v9 before v18)."""
+    return [int(n) if n.isdigit() else n for n in re.split(r"(\d+)", path)]
+
+
 def numbered(pattern):
     """Files matching pattern, sorted so frame2 comes before frame10."""
-    return sorted(glob.glob(os.path.join(ASSETS, pattern)),
-                  key=lambda f: [int(n) if n.isdigit() else n for n in re.split(r"(\d+)", f)])
+    return sorted(glob.glob(os.path.join(ASSETS, pattern)), key=natural_key)
 
 
 def find_program(name, *fallbacks):
@@ -254,8 +290,12 @@ class PiBackend:
     key, label = "pi", "pi"
 
     def program(self):
-        nvm = sorted(glob.glob(os.path.expanduser("~/.nvm/versions/node/*/bin/pi")))
-        return find_program("pi", os.path.expanduser("~/.local/bin/pi"), *reversed(nvm))
+        for location in PI_LOCATIONS:
+            # newest node version first when a pattern matches several installs
+            for path in sorted(glob.glob(os.path.expanduser(location)), key=natural_key, reverse=True):
+                if os.access(path, os.X_OK):
+                    return path
+        return "pi"
 
     def new_session_id(self):
         return str(uuid.uuid4())  # pi creates the session on first use of --session-id
@@ -423,6 +463,21 @@ class Mascot(Gtk.DrawingArea):
         self.dance_centers = [body_center_x(f) for f in self.dance_frames]
         self.dance_until = 0.0
         self.dance_start = 0.0
+        fish_files = [os.path.join(ASSETS, n + ".png") for n in FISH_FRAMES]
+        self.catches = [load_sprite_like(os.path.basename(f)) for f in numbered("fish[0-9]*.png")]
+        if self.catches and all(os.path.exists(f) for f in fish_files):
+            self.fish_sprites = {n: load_sprite_like(n + ".png") for n in FISH_FRAMES}
+        else:
+            self.fish_sprites = {}
+        # line every frame up on the body's feet so he doesn't slide around as the art changes size
+        self.fish_feet = {n: body_feet(f) for n, f in self.fish_sprites.items()}
+        self.frog_feet_gap = self.frog.get_height() - body_feet(self.frog)[1]
+        _, _, ref_h = GdkPixbuf.Pixbuf.get_file_info(os.path.join(ASSETS, "frog.png"))
+        self.fish_scale = SPRITE_H / ref_h
+        self.fish_steps = []
+        self.fish_start = 0.0
+        self.fish_until = 0.0
+        self.catch = None
         self.mouth = self.mouths[0]
         self.next_mouth = 0.0
         self.t = 0.0
@@ -457,6 +512,39 @@ class Mascot(Gtk.DrawingArea):
     def stop_dancing(self):
         self.dance_until = 0.0
 
+    @property
+    def fishing(self):
+        return time.monotonic() < self.fish_until
+
+    def go_fishing(self):
+        """side_neutral, then wait on fishing1 (blinking on fishing2) until a bite, then reel it in and celebrate."""
+        if not self.fish_sprites or self.napping:
+            return
+        wait, waited = random.uniform(*FISH_WAIT_SECONDS), 0.0
+        steps = [("side_neutral", 0.25)]
+        while waited < wait:  # mostly eyes open on fishing1, with a quick blink on fishing2
+            stare = random.uniform(*FISH_STARE)
+            steps += [("fishing1", stare), ("fishing2", FISH_BLINK)]
+            waited += stare + FISH_BLINK
+        self.fish_steps = (steps[:-1]  # don't blink right as he gets the bite
+                           + [("fish_caught", 1.2), ("fish_pull_frame1", 0.3),
+                              ("fish_pull_frame2", 0.3), ("fish_pull_frame3", 0.5),
+                              ("fish_celebrate", 2.5)])
+        self.catch = random.choice(self.catches)
+        self.fish_start = time.monotonic()
+        self.fish_until = self.fish_start + sum(d for _, d in self.fish_steps)
+
+    def stop_fishing(self):
+        self.fish_until = 0.0
+
+    def fish_step(self):
+        left = time.monotonic() - self.fish_start
+        for name, seconds in self.fish_steps:
+            if left < seconds:
+                return name
+            left -= seconds
+        return self.fish_steps[-1][0]
+
     def wake(self, startled):
         self.napping = False
         if startled:
@@ -483,6 +571,8 @@ class Mascot(Gtk.DrawingArea):
             return self.draw_nap(cr)
         if self.dancing:
             return self.draw_dance(cr)
+        if self.fishing:
+            return self.draw_fishing(cr)
         W, H = self.get_allocated_width(), self.get_allocated_height()
         t, now = self.t, time.monotonic()
         talking = now < self.talk_until
@@ -556,6 +646,53 @@ class Mascot(Gtk.DrawingArea):
         cr.restore()
         return False
 
+    def draw_fishing(self, cr):
+        W, H = self.get_allocated_width(), self.get_allocated_height()
+        name = self.fish_step()
+        sprite = self.fish_sprites[name]
+        sh = sprite.get_height()
+        # The rod sticks out to his left, so stand him right of centre if it wouldn't fit.
+        body_x = max(W / 2, max(cx for cx, _ in self.fish_feet.values()) + 2)
+        feet_x, feet_y = self.fish_feet[name]
+        lean = hop = 0.0
+        if name == "fish_celebrate":  # a little victory dance, leaning one way then the other
+            swing = math.sin(math.pi * self.t / DANCE_BEAT)
+            lean, hop = DANCE_LEAN * swing, abs(swing) * 4
+        left, top = -feet_x, -feet_y
+
+        cr.save()
+        cr.translate(body_x + lean * 20, H - 7)
+        cr.scale(1, 0.2)
+        cr.arc(0, 0, self.frog.get_width() * 0.42 - hop, 0, 2 * math.pi)
+        cr.restore()
+        cr.set_source_rgba(0, 0, 0, 0.16)
+        cr.fill()
+
+        cr.save()
+        cr.translate(body_x, H - 8 - self.frog_feet_gap - hop)  # pivot at his feet
+        cr.rotate(lean)
+        # the catch goes behind the sprite, so the line's end and his hand overlap it
+        fish = self.catch
+        fw, fh = fish.get_width(), fish.get_height()
+        if name in FISH_LINE_ENDS:  # hooked by the mouth, swinging as he yanks it up
+            x, y = FISH_LINE_ENDS[name]
+            cr.save()
+            cr.translate(left + x * self.fish_scale, top + y * self.fish_scale)
+            cr.rotate(0.3 * math.sin(self.t * 9))
+            Gdk.cairo_set_source_pixbuf(cr, fish, -fw / 2, -2)
+            cr.paint()
+            cr.restore()
+        elif name == "fish_celebrate":  # held up by the tail
+            x, y = FISH_HAND
+            Gdk.cairo_set_source_pixbuf(cr, fish, left + x * self.fish_scale - fw / 2,
+                                        top + y * self.fish_scale - fh * 0.8)
+            cr.paint()
+
+        Gdk.cairo_set_source_pixbuf(cr, sprite, left, top)
+        cr.paint()
+        cr.restore()
+        return False
+
     def draw_nap(self, cr):
         W, H = self.get_allocated_width(), self.get_allocated_height()
         sprite = self.nap_frames[self.nap_frame]
@@ -622,7 +759,7 @@ class FregWindow(Gtk.ApplicationWindow):
         self.press = None
         self.dragging = False
         self.quiet = False
-        self.antics = True  # naps and dancing when idle
+        self.antics = True  # naps, dancing and fishing when idle
         self.nap_end_id = None
         self.last_interaction = time.monotonic()
         self.speech_hide_id = None
@@ -766,6 +903,7 @@ class FregWindow(Gtk.ApplicationWindow):
                 self.wake_up(startled=True)  # this click just wakes him
             else:
                 self.mascot.stop_dancing()
+                self.mascot.stop_fishing()
                 self.toggle_ask()
         self.last_interaction = time.monotonic()
         self.press = None
@@ -787,7 +925,7 @@ class FregWindow(Gtk.ApplicationWindow):
         quiet = Gtk.CheckMenuItem(label="Quiet mode (no ribbits)", active=self.quiet)
         quiet.connect("toggled", self.on_quiet_toggled)
         menu.insert(quiet, 4)
-        antics = Gtk.CheckMenuItem(label="Idle antics (naps, dancing)", active=self.antics)
+        antics = Gtk.CheckMenuItem(label="Idle antics (naps, dancing, fishing)", active=self.antics)
         antics.connect("toggled", self.on_antics_toggled)
         menu.insert(antics, 5)
         pos = 6
@@ -801,6 +939,11 @@ class FregWindow(Gtk.ApplicationWindow):
             dance = Gtk.MenuItem(label="Dance!")
             dance.connect("activate", lambda *_: self.start_dance())
             menu.insert(dance, pos)
+            pos += 1
+        if self.mascot.fish_sprites:
+            fish = Gtk.MenuItem(label="Go fishing")
+            fish.connect("activate", lambda *_: self.start_fishing())
+            menu.insert(fish, pos)
         agents = Gtk.Menu()
         group = None
         for backend in BACKENDS.values():
@@ -853,6 +996,7 @@ class FregWindow(Gtk.ApplicationWindow):
         self.entry.set_text("")
         self.last_interaction = time.monotonic()
         self.mascot.stop_dancing()
+        self.mascot.stop_fishing()
         self.toggle_ask(False)
         self.hide_speech()
         self.reply, self.pages, self.page = "", [], 0
@@ -968,13 +1112,13 @@ class FregWindow(Gtk.ApplicationWindow):
 
     def maybe_quip(self):
         if not (self.quiet or self.speech_area.get_visible() or self.ask_area.get_visible()
-                or self.session.busy or self.mascot.dancing):
+                or self.session.busy or self.mascot.dancing or self.mascot.fishing):
             self.show_quip(random.choice(QUIPS))
             GLib.timeout_add_seconds(4, lambda: self.show_quip("Ribbit!") and False)
         self.schedule_quip()
         return False
 
-    # ---------- idle antics: naps and dancing ----------
+    # ---------- idle antics: naps, dancing and fishing ----------
 
     def schedule_nap(self):
         GLib.timeout_add_seconds(int(random.uniform(*NAP_MINUTES) * 60), self.maybe_antic)
@@ -982,10 +1126,12 @@ class FregWindow(Gtk.ApplicationWindow):
     def maybe_antic(self):
         idle = (time.monotonic() - self.last_interaction > 120
                 and not (self.speech_area.get_visible() or self.ask_area.get_visible()
-                         or self.session.busy or self.mascot.napping or self.mascot.dancing))
+                         or self.session.busy or self.mascot.napping or self.mascot.dancing
+                         or self.mascot.fishing))
         if self.antics and idle:
             options = [f for f, ok in ((self.start_nap, self.mascot.nap_frames),
-                                       (self.start_dance, self.mascot.dance_frames)) if ok]
+                                       (self.start_dance, self.mascot.dance_frames),
+                                       (self.start_fishing, self.mascot.fish_sprites)) if ok]
             if options:
                 random.choice(options)()
         self.schedule_nap()
@@ -996,12 +1142,22 @@ class FregWindow(Gtk.ApplicationWindow):
             return
         if self.speech_mode == "quip":
             self.hide_speech()
+        self.mascot.stop_fishing()
         self.mascot.dance(random.uniform(*DANCE_SECONDS))
+
+    def start_fishing(self):
+        if self.mascot.napping or self.session.busy:
+            return
+        if self.speech_mode == "quip":
+            self.hide_speech()
+        self.mascot.stop_dancing()
+        self.mascot.go_fishing()
 
     def start_nap(self):
         if self.mascot.napping or self.session.busy:
             return
         self.mascot.stop_dancing()
+        self.mascot.stop_fishing()
         self.toggle_ask(False)
         if self.speech_mode == "quip":
             self.hide_speech()
@@ -1068,7 +1224,10 @@ class FregWindow(Gtk.ApplicationWindow):
                      ["x-terminal-emulator", "-e"],
                      ["xterm", "-e"]):
             if shutil.which(term[0]):
-                subprocess.Popen(term + cmd, cwd=WORKDIR, env=child_env(cmd[0]),
+                env = child_env(cmd[0])
+                # Terminals like ptyxis and gnome-terminal start the command from a background
+                # server with its own environment, so pass PATH (for pi's node) on the command line.
+                subprocess.Popen(term + ["env", "PATH=" + env["PATH"]] + cmd, cwd=WORKDIR, env=env,
                                  start_new_session=True)
                 # The terminal now owns the conversation; start fresh here.
                 if self.session.session_id:
