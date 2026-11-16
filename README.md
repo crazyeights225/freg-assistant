@@ -7,7 +7,8 @@ Freg is a little desktop assistant inspired by clippy. I drew the frog in like 5
 
 Freg is a little desktop frog that sits in the corner of your screen and talks to a coding
 agent: Claude Code or [pi](https://pi.dev).
-Click Freg to ask a question and the reply appears as speech bubbles. When nobody is talking to Freg, it tells the odd pun, takes naps, dances and goes fishing.
+Click Freg to ask a question and the reply appears as speech bubbles. Replies can use
+light Markdown: bold, italics, lists, `inline code` and fenced code blocks. When nobody is talking to Freg, it tells the odd pun, takes naps, dances and goes fishing.
 
 Here an example of freg on my desktop
 
@@ -67,6 +68,8 @@ The right-click menu has these options:
 - **Continue in terminal**: reopens the conversation in ptyxis, GNOME Terminal, Console
   or Konsole, with `claude --resume <session-id>` or `pi --session <session-id>`.
 - **New conversation**: starts a new session.
+- **Copy code**: shown when the reply has code blocks. Copies the code in the bubble you're
+  looking at, or all the code in the reply if that bubble has none.
 - **Agent**: switches between Claude Code and pi. Switching starts a new conversation.
 - **Quiet mode**: stops the random quips.
 - **Idle antics**: turns the naps, dancing and fishing on or off.

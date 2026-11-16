@@ -30,7 +30,8 @@ import gi  # noqa: E402
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Gdk, GdkPixbuf, GLib, Gtk  # noqa: E402
+gi.require_version("Pango", "1.0")
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk, Pango  # noqa: E402
 
 WORKDIR = os.path.expanduser(os.environ.get("FREG_WORKDIR", "~"))
 AGENT = os.environ.get("FREG_AGENT", "claude")  # "claude" or "pi"; switchable from the menu
@@ -97,6 +98,8 @@ SPEECH_H = 270  # tallest a speech bubble gets (long paragraphs are split into p
 ASK_H = 64  # the ask box plus its tail
 WINDOW_H = SPEECH_H + 14 + ASK_H + MASCOT_H  # fixed: room for both bubbles above Freg
 PAGE_CHARS = 240  # split paragraphs longer than this into several bubbles
+CODE_PAGE_LINES = 9  # split code blocks longer than this into several bubbles
+CODE_LEAD_CHARS = 120  # a short line like "Try this:" shares a bubble with the code after it
 DEBUG = bool(os.environ.get("FREG_DEBUG"))
 # Where pi might be installed, tried in order; autostarted apps often lack these on PATH.
 PI_LOCATIONS = [
@@ -162,10 +165,13 @@ SYSTEM_PROMPT = (
     "You are Freg, a friendly little frog who lives in the corner of the user's "
     "Linux (GNOME) desktop. Your replies are shown as cartoon speech bubbles, one "
     "paragraph per bubble, so keep them short and conversational: usually one to "
-    "three short paragraphs of plain text. Don't use markdown (no headings, bold, "
-    "bullet lists or code fences). If a task needs long output, code, or lots of "
-    "hands-on work, suggest the user right-click you and choose 'Continue in "
-    "terminal' to carry on this conversation there."
+    "three short paragraphs. The bubbles are narrow (about 40 characters) and render "
+    "light markdown: **bold**, *italic*, `inline code`, short bullet lists and fenced "
+    "code blocks. Use a fenced code block for commands and code snippets, and keep "
+    "them short (a few lines, short lines). Avoid headings, tables and images. If a "
+    "task needs long output, lots of code, or lots of hands-on work, suggest the user "
+    "right-click you and choose 'Continue in terminal' to carry on this conversation "
+    "there."
 )
 
 CSS = """
@@ -179,6 +185,13 @@ window.freg { background-color: transparent; }
 .speech label.text { font-family: "@FREG_FONT@"; font-size: 1.15em; color: #E6E4F0; }
 .speech label.text.err { color: #F08A80; }
 .speech label.hint { color: #8C8AA6; font-size: 0.85em; }
+.speech .code {
+  background-color: #16161D;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 5px 7px;
+}
+.speech .code label { font-family: monospace; font-size: 0.85em; color: #C8E6A0; }
 .ask { padding: 7px; }
 .ask entry {
   background-color: #1A1A22; color: #E6E4F0; caret-color: #9C9CD8;
@@ -454,28 +467,163 @@ class AgentSession:
 
 
 
-def split_pages(text):
-    """One speech bubble per paragraph; overly long paragraphs become several bubbles."""
-    pages = []
-    for para in re.split(r"\n\s*\n", text):
-        para = para.strip()
-        if not para:
-            continue
-        page = ""
-        for sentence in re.split(r"(?<=[.!?])\s+", para):
-            if len(sentence) > PAGE_CHARS:  # one giant sentence: break it at word boundaries
-                if page:
-                    pages.append(page)
-                *full, page = textwrap.wrap(sentence, PAGE_CHARS) or [""]
-                pages.extend(full)
-            elif page and len(page) + 1 + len(sentence) > PAGE_CHARS:
-                pages.append(page)
-                page = sentence
+FENCE = re.compile(r"^\s*(```|~~~)")
+LIST_ITEM = re.compile(r"^\s*([-*+]|\d+[.)])\s+")
+HEADING = re.compile(r"^\s*#{1,6}\s+")
+
+
+def md_blocks(text):
+    """Break markdown into ("text", paragraph) and ("code", fenced block) pieces. A fence
+    that hasn't closed yet (the reply is still streaming in) runs to the end."""
+    blocks, para, code, fence = [], [], None, None
+    for line in text.split("\n"):
+        if code is not None:
+            if line.strip().startswith(fence):
+                blocks.append(("code", code))
+                code = None
             else:
-                page = f"{page} {sentence}" if page else sentence
-        if page:
+                code.append(line.rstrip())
+        elif FENCE.match(line):
+            if para:
+                blocks.append(("text", "\n".join(para)))
+                para = []
+            fence, code = FENCE.match(line).group(1), []
+        elif not line.strip():
+            if para:
+                blocks.append(("text", "\n".join(para)))
+                para = []
+        else:
+            para.append(line.rstrip())
+    if para:
+        blocks.append(("text", "\n".join(para)))
+    if code is not None:
+        while code and not code[-1].strip():
+            code.pop()
+        if code:
+            blocks.append(("code", code))
+    return blocks
+
+
+def split_prose(para):
+    """A paragraph as one or more pages of at most PAGE_CHARS."""
+    pages = []
+    lines = para.split("\n")
+    if any(LIST_ITEM.match(l) or HEADING.match(l) for l in lines):
+        # A list (or a heading over some text): keep its lines; break between items.
+        page = ""
+        for line in lines:
+            if page and len(page) + 1 + len(line) > PAGE_CHARS:
+                pages.append(page)
+                page = line
+            else:
+                page = f"{page}\n{line}" if page else line
+        return pages + [page] if page else pages
+    page = ""
+    for sentence in re.split(r"(?<=[.!?])\s+", " ".join(l.strip() for l in lines)):
+        if len(sentence) > PAGE_CHARS:  # one giant sentence: break it at word boundaries
+            if page:
+                pages.append(page)
+            *full, page = textwrap.wrap(sentence, PAGE_CHARS) or [""]
+            pages.extend(full)
+        elif page and len(page) + 1 + len(sentence) > PAGE_CHARS:
             pages.append(page)
+            page = sentence
+        else:
+            page = f"{page} {sentence}" if page else sentence
+    if page:
+        pages.append(page)
     return pages
+
+
+def split_pages(text):
+    """One speech bubble per paragraph; overly long paragraphs and code blocks become
+    several bubbles. Pages are still markdown; render_markdown draws them."""
+    pages = []
+    lead = None  # a short last prose page that the next code block may join
+    for kind, body in md_blocks(text):
+        if kind == "text":
+            pages.extend(split_prose(body))
+            lead = len(pages) - 1 if len(pages[-1]) <= CODE_LEAD_CHARS else None
+            continue
+        chunks = [body[i:i + CODE_PAGE_LINES] for i in range(0, len(body), CODE_PAGE_LINES)]
+        for n, chunk in enumerate(chunks):
+            fenced = "```\n" + "\n".join(chunk) + "\n```"
+            if n == 0 and lead is not None and lead == len(pages) - 1:
+                pages[-1] += "\n" + fenced
+            else:
+                pages.append(fenced)
+        lead = None
+    return pages
+
+
+def inline_markup(text):
+    """One line of markdown prose as Pango markup."""
+    codes = []
+
+    def stash(m):
+        codes.append(m.group(1))
+        return f"\ue000{len(codes) - 1}\ue001"
+    text = re.sub(r"`([^`]+)`", stash, text)
+    text = GLib.markup_escape_text(text)
+    text = re.sub(r"\*\*(.+?)\*\*|__(.+?)__", lambda m: f"<b>{m.group(1) or m.group(2)}</b>", text)
+    text = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", text)
+    text = re.sub(r"(?<!\w)_(?!\s)(.+?)(?<!\s)_(?!\w)", r"<i>\1</i>", text)
+    text = re.sub(r"~~(.+?)~~", r"<s>\1</s>", text)
+    text = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", r"<u>\1</u>", text)
+    return re.sub(r"\ue000(\d+)\ue001", lambda m: (
+        '<span font_family="monospace" size="smaller" background="#16161D" '
+        f'foreground="#C8E6A0"> {GLib.markup_escape_text(codes[int(m.group(1))])} </span>'), text)
+
+
+def prose_markup(text):
+    lines = []
+    for line in text.split("\n"):
+        if HEADING.match(line):
+            line = f"<b>{inline_markup(HEADING.sub('', line))}</b>"
+        elif re.match(r"^\s*[-*+]\s+", line):
+            indent = len(line) - len(line.lstrip())
+            line = "  " * (indent // 2) + "• " + inline_markup(re.sub(r"^\s*[-*+]\s+", "", line))
+        elif re.match(r"^\s*>\s?", line):
+            quote = inline_markup(re.sub(r"^\s*>\s?", "", line))
+            line = f'<span foreground="#8C8AA6"><i>{quote}</i></span>'
+        else:
+            line = inline_markup(line)
+        lines.append(line)
+    markup = "\n".join(lines)
+    try:
+        Pango.parse_markup(markup, -1, "\0")
+        return markup
+    except GLib.Error:  # e.g. "**a *b** c*": fall back to the plain words
+        return GLib.markup_escape_text(text)
+
+
+def render_markdown(box, text, error=False):
+    """Fill box with labels for one page: prose, and dark boxes for code blocks."""
+    for child in box.get_children():
+        box.remove(child)
+    for kind, body in md_blocks(text):
+        if kind == "code":
+            label = Gtk.Label(xalign=0, wrap=True)
+            label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.set_max_width_chars(34)
+            label.set_text("\n".join(body))
+            frame = Gtk.Box()
+            frame.get_style_context().add_class("code")
+            frame.pack_start(label, True, True, 0)
+            box.pack_start(frame, False, False, 0)
+        else:
+            label = Gtk.Label(wrap=True, max_width_chars=28, xalign=0)
+            label.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.get_style_context().add_class("text")
+            if error:
+                label.get_style_context().add_class("err")
+            label.set_markup(prose_markup(body))
+            box.pack_start(label, False, False, 0)
+    box.show_all()
+
+
+def code_blocks(text):
+    return ["\n".join(body) for kind, body in md_blocks(text) if kind == "code"]
 
 
 class Mascot(Gtk.DrawingArea):
@@ -1164,8 +1312,7 @@ class FregWindow(Gtk.ApplicationWindow):
         outer.pack_start(root, True, True, 0)
 
         # Speech bubble: Freg's replies (one page at a time) and quips.
-        self.speech_text = Gtk.Label(wrap=True, max_width_chars=28, xalign=0)
-        self.speech_text.get_style_context().add_class("text")
+        self.speech_text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.speech_hint = Gtk.Label(xalign=1)
         self.speech_hint.get_style_context().add_class("hint")
         speech_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -1350,6 +1497,10 @@ class FregWindow(Gtk.ApplicationWindow):
             item = Gtk.MenuItem(label=label)
             item.connect("activate", cb)
             menu.append(item)
+        if code_blocks(self.reply):
+            item = Gtk.MenuItem(label="Copy code")
+            item.connect("activate", self.copy_code)
+            menu.append(item)
         agents = Gtk.Menu()
         group = None
         for backend in BACKENDS.values():
@@ -1468,12 +1619,8 @@ class FregWindow(Gtk.ApplicationWindow):
 
     def render_page(self):
         text = self.pages[self.page]
-        self.speech_text.set_text(text)
-        ctx = self.speech_text.get_style_context()
-        if self.reply_error and self.page == len(self.pages) - 1:
-            ctx.add_class("err")
-        else:
-            ctx.remove_class("err")
+        error = bool(self.reply_error) and self.page == len(self.pages) - 1
+        render_markdown(self.speech_text, text, error)
         n = len(self.pages)
         if self.page < n - 1:
             hint = f"{self.page + 1}/{n}  ▸"
@@ -1502,8 +1649,7 @@ class FregWindow(Gtk.ApplicationWindow):
         if self.ask_area.get_visible() and not aside:
             return  # don't chatter while they're typing
         self.speech_mode = "quip"
-        self.speech_text.set_text(text)
-        self.speech_text.get_style_context().remove_class("err")
+        render_markdown(self.speech_text, text)
         self.speech_hint.hide()
         self.speech_area.show()
         self.mascot.talk_until = 0.0
@@ -1928,6 +2074,17 @@ class FregWindow(Gtk.ApplicationWindow):
         self.session.switch(backend)
         self.set_busy(False)
         self.say_aside(f"Now talking through {backend.label}. Fresh start!")
+
+    def copy_code(self, *_):
+        """Copy the code on the bubble you're looking at, or else all the code in the reply."""
+        page = self.pages[self.page] if self.speech_mode == "reply" and self.pages else ""
+        code = "\n\n".join(code_blocks(page) or code_blocks(self.reply))
+        Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD).set_text(code, -1)
+        if self.speech_mode == "reply":  # keep the reply up; just note it in the corner
+            self.speech_hint.set_text("copied ✓")
+            self.speech_hint.show()
+        else:
+            self.say_aside("Copied! Ribbit.")
 
     def new_chat(self, *_):
         self.generation += 1
